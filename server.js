@@ -49,7 +49,7 @@ function readBody(req) {
     let raw = "";
     req.on("data", (chunk) => {
       raw += chunk;
-      if (raw.length > 2 * 1024 * 1024) reject(new Error("Payload too large"));
+      if (raw.length > 5 * 1024 * 1024) reject(new Error("Payload too large"));
     });
     req.on("end", () => {
       try {
@@ -60,6 +60,27 @@ function readBody(req) {
     });
     req.on("error", reject);
   });
+}
+
+function writeTempCookies(cookiesTxt) {
+  if (!cookiesTxt || typeof cookiesTxt !== "string" || !cookiesTxt.trim()) {
+    return null;
+  }
+  const cookiePath = path.join(
+    TEMP_DIR,
+    `ck_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.txt`
+  );
+  fs.writeFileSync(cookiePath, cookiesTxt, { encoding: "utf8", mode: 0o600 });
+  return cookiePath;
+}
+
+function removeFileQuietly(filePath) {
+  if (!filePath) return;
+  try {
+    fs.unlinkSync(filePath);
+  } catch {
+    // ignore
+  }
 }
 
 function buildFormatOptions(info) {
@@ -130,9 +151,15 @@ function buildFormatOptions(info) {
   return options;
 }
 
-function probeUrl(targetUrl) {
+function probeUrl(targetUrl, cookiesTxt) {
   return new Promise((resolve, reject) => {
-    const args = ["-J", "--no-playlist", "--no-warnings", targetUrl];
+    const cookiePath = writeTempCookies(cookiesTxt);
+    const args = ["-J", "--no-playlist", "--no-warnings"];
+    if (cookiePath) {
+      args.push("--cookies", cookiePath);
+    }
+    args.push(targetUrl);
+
     const proc = spawn("yt-dlp", args);
 
     let stdout = "";
@@ -142,15 +169,27 @@ function probeUrl(targetUrl) {
     proc.stderr.on("data", (d) => (stderr += d.toString()));
 
     proc.on("error", () => {
+      removeFileQuietly(cookiePath);
       reject(new Error("yt-dlp binary missing in container."));
     });
 
     proc.on("close", (code) => {
+      removeFileQuietly(cookiePath);
+
       if (code !== 0) {
         if (/DRM|Widevine|protected/i.test(stderr)) {
           return reject(new Error("This video is DRM-protected and cannot be downloaded."));
         }
-        return reject(new Error(stderr.split("\n").filter(Boolean).pop() || "No downloadable media found."));
+        if (/Sign in to confirm|not a bot/i.test(stderr)) {
+          return reject(
+            new Error("YouTube verification required. Make sure you are signed into YouTube in Chrome and try again.")
+          );
+        }
+        const cleanErr = stderr
+          .split("\n")
+          .filter((l) => l.trim().startsWith("ERROR:"))
+          .pop();
+        return reject(new Error(cleanErr || "No downloadable media found on this page."));
       }
 
       try {
@@ -181,12 +220,13 @@ function scheduleCleanup(jobDir, delayMs = 15 * 60 * 1000) {
   }, delayMs);
 }
 
-function startDownloadJob({ url, formatPreset = "best", container = "mp4", title = "Video" }) {
+function startDownloadJob({ url, formatPreset = "best", container = "mp4", title = "Video", cookiesTxt }) {
   const id = `job_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
   const safeTitle = sanitize(title);
   const jobDir = path.join(TEMP_DIR, id);
   fs.mkdirSync(jobDir, { recursive: true });
 
+  const cookiePath = writeTempCookies(cookiesTxt);
   const outTemplate = path.join(jobDir, `${safeTitle}.%(ext)s`);
 
   const args = [
@@ -197,6 +237,10 @@ function startDownloadJob({ url, formatPreset = "best", container = "mp4", title
     "-o",
     outTemplate
   ];
+
+  if (cookiePath) {
+    args.push("--cookies", cookiePath);
+  }
 
   if (formatPreset === "audio_mp3") {
     args.push("-x", "--audio-format", "mp3", "--audio-quality", "0");
@@ -227,7 +271,6 @@ function startDownloadJob({ url, formatPreset = "best", container = "mp4", title
     status: "starting",
     filePath: null,
     outputFilename: `${safeTitle}.${container || "mp4"}`,
-    downloadedToBrowser: false,
     error: null,
     pid: proc.pid
   };
@@ -258,12 +301,15 @@ function startDownloadJob({ url, formatPreset = "best", container = "mp4", title
   });
 
   proc.on("error", (err) => {
+    removeFileQuietly(cookiePath);
     job.status = "error";
     job.error = err.message;
     scheduleCleanup(jobDir, 60 * 1000);
   });
 
   proc.on("close", (code) => {
+    removeFileQuietly(cookiePath);
+
     if (job.status === "cancelled") {
       scheduleCleanup(jobDir, 5000);
       return;
@@ -334,7 +380,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && reqUrl.pathname === "/probe") {
       const body = await readBody(req);
       if (!body.url) return sendJson(res, 400, { ok: false, error: "URL is required." });
-      const result = await probeUrl(body.url);
+      const result = await probeUrl(body.url, body.cookiesTxt);
       return sendJson(res, 200, { ok: true, ...result });
     }
 
