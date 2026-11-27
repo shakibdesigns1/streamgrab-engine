@@ -1,6 +1,5 @@
 FROM node:20-slim
 
-# Install Python, FFmpeg, and curl for yt-dlp
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     ffmpeg \
@@ -14,7 +13,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY server.js /app/server.js
 
-# Hugging Face Spaces uses port 7860 by default
 ENV PORT=7860
 EXPOSE 7860
 

@@ -88,6 +88,7 @@ function buildFormatOptions(info) {
   const heights = new Set();
 
   for (const f of rawFormats) {
+    if (f.ext === "mhtml" || f.protocol === "mhtml") continue;
     if (f.vcodec && f.vcodec !== "none" && f.height) {
       heights.add(f.height);
     }
@@ -109,7 +110,7 @@ function buildFormatOptions(info) {
     if (sortedHeights.some((sh) => sh === h || (h === 2160 && sh >= 2000))) {
       options.push({
         label: h === 2160 ? "4K (2160p)" : h === 1440 ? "2K (1440p)" : `${h}p HD`,
-        note: "MP4 H.264/Merged",
+        note: "MP4 Merged",
         preset: `${h}p`,
         container: "mp4",
         isAudio: false
@@ -151,17 +152,21 @@ function buildFormatOptions(info) {
   return options;
 }
 
-function probeUrl(targetUrl, cookiesTxt) {
+function runProbeAttempt(targetUrl, cookiePath, extraArgs = []) {
   return new Promise((resolve, reject) => {
-    const cookiePath = writeTempCookies(cookiesTxt);
-    const args = ["-J", "--no-playlist", "--no-warnings"];
+    const args = [
+      "-J",
+      "--ignore-no-formats-error",
+      "--no-playlist",
+      "--no-warnings",
+      ...extraArgs
+    ];
     if (cookiePath) {
       args.push("--cookies", cookiePath);
     }
     args.push(targetUrl);
 
     const proc = spawn("yt-dlp", args);
-
     let stdout = "";
     let stderr = "";
 
@@ -169,45 +174,73 @@ function probeUrl(targetUrl, cookiesTxt) {
     proc.stderr.on("data", (d) => (stderr += d.toString()));
 
     proc.on("error", () => {
-      removeFileQuietly(cookiePath);
       reject(new Error("yt-dlp binary missing in container."));
     });
 
     proc.on("close", (code) => {
-      removeFileQuietly(cookiePath);
-
-      if (code !== 0) {
-        if (/DRM|Widevine|protected/i.test(stderr)) {
-          return reject(new Error("This video is DRM-protected and cannot be downloaded."));
-        }
-        if (/Sign in to confirm|not a bot/i.test(stderr)) {
-          return reject(
-            new Error("YouTube verification required. Make sure you are signed into YouTube in Chrome and try again.")
-          );
-        }
-        const cleanErr = stderr
-          .split("\n")
-          .filter((l) => l.trim().startsWith("ERROR:"))
-          .pop();
-        return reject(new Error(cleanErr || "No downloadable media found on this page."));
+      if (code !== 0 || !stdout.trim()) {
+        return reject(new Error(stderr || "Probe failed"));
       }
-
       try {
         const info = JSON.parse(stdout);
-        if (info.is_drm || info.drm) {
-          return reject(new Error("This video is DRM-protected and cannot be downloaded."));
-        }
-        resolve({
-          url: targetUrl,
-          title: info.title || "Video",
-          duration: info.duration || 0,
-          formats: buildFormatOptions(info)
-        });
+        resolve(info);
       } catch {
         reject(new Error("Failed to parse media metadata."));
       }
     });
   });
+}
+
+async function probeUrl(targetUrl, cookiesTxt) {
+  const cookiePath = writeTempCookies(cookiesTxt);
+  try {
+    let info;
+    try {
+      info = await runProbeAttempt(targetUrl, cookiePath);
+    } catch (firstErr) {
+      if (/youtube\.com|youtu\.be/i.test(targetUrl)) {
+        try {
+          info = await runProbeAttempt(targetUrl, cookiePath, [
+            "--extractor-args",
+            "youtube:player_client=tv,web_safari,mweb"
+          ]);
+        } catch {
+          throw firstErr;
+        }
+      } else {
+        throw firstErr;
+      }
+    }
+
+    if (info.is_drm || info.drm) {
+      throw new Error("This video is DRM-protected and cannot be downloaded.");
+    }
+
+    return {
+      url: targetUrl,
+      title: info.title || "Video",
+      duration: info.duration || 0,
+      formats: buildFormatOptions(info)
+    };
+  } catch (err) {
+    const msg = err.message || "";
+    if (/DRM|Widevine|protected/i.test(msg)) {
+      throw new Error("This video is DRM-protected and cannot be downloaded.");
+    }
+    if (/Sign in to confirm|not a bot/i.test(msg)) {
+      throw new Error("Sign into YouTube in Chrome and try again.");
+    }
+    if (/Unsupported URL/i.test(msg)) {
+      throw new Error("UNSUPPORTED_SITE");
+    }
+    const cleanErr = msg
+      .split("\n")
+      .filter((l) => l.trim().startsWith("ERROR:"))
+      .pop();
+    throw new Error(cleanErr || "No extractor formats found.");
+  } finally {
+    removeFileQuietly(cookiePath);
+  }
 }
 
 function scheduleCleanup(jobDir, delayMs = 15 * 60 * 1000) {
@@ -242,6 +275,10 @@ function startDownloadJob({ url, formatPreset = "best", container = "mp4", title
     args.push("--cookies", cookiePath);
   }
 
+  if (/youtube\.com|youtu\.be/i.test(url)) {
+    args.push("--extractor-args", "youtube:player_client=tv,web_safari,default");
+  }
+
   if (formatPreset === "audio_mp3") {
     args.push("-x", "--audio-format", "mp3", "--audio-quality", "0");
   } else if (formatPreset === "audio_m4a") {
@@ -250,9 +287,9 @@ function startDownloadJob({ url, formatPreset = "best", container = "mp4", title
     const heightMatch = formatPreset.match(/^(\d+)p$/);
     if (heightMatch) {
       const h = heightMatch[1];
-      args.push("-f", `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best`);
+      args.push("-f", `bv*[height<=${h}]+ba/b[height<=${h}]/bv*+ba/b`);
     } else {
-      args.push("-f", "bestvideo+bestaudio/best");
+      args.push("-f", "bv*+ba/b");
     }
     args.push("--merge-output-format", container || "mp4");
   }
@@ -277,6 +314,8 @@ function startDownloadJob({ url, formatPreset = "best", container = "mp4", title
 
   jobs.set(id, job);
 
+  let stderrTail = "";
+
   const parseProgressLine = (line) => {
     const dlMatch = line.match(/\[download\]\s+([\d.]+)%\s+of\s+~?\s*([\d.\w]+)(?:\s+at\s+([\d.\w/]+))?/);
     if (dlMatch) {
@@ -289,6 +328,9 @@ function startDownloadJob({ url, formatPreset = "best", container = "mp4", title
     if (/\[Merger\]|\[ExtractAudio\]|Merging formats/i.test(line)) {
       job.status = "merging";
       job.percent = 99;
+    }
+    if (line.trim().startsWith("ERROR:")) {
+      stderrTail = line.trim();
     }
   };
 
@@ -327,7 +369,7 @@ function startDownloadJob({ url, formatPreset = "best", container = "mp4", title
       }
     }
     job.status = "error";
-    job.error = "Download failed or blocked by site.";
+    job.error = stderrTail || "Download failed or blocked by site.";
     scheduleCleanup(jobDir, 60 * 1000);
   });
 
