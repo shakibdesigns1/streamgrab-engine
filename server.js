@@ -1,5 +1,6 @@
 const http = require("http");
 const { spawn, execSync } = require("child_process");
+const { Readable } = require("stream");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -24,7 +25,8 @@ const BIN_STATUS = {
   ffmpeg: hasBinary("ffmpeg")
 };
 
-const jobs = new Map();
+// Short-lived in-memory stream tokens (zero disk usage for large videos)
+const streamTokens = new Map();
 
 function sanitize(name, maxLen = 85) {
   return (name || "video")
@@ -86,11 +88,13 @@ function removeFileQuietly(filePath) {
 function buildFormatOptions(info) {
   const rawFormats = Array.isArray(info.formats) ? info.formats : [];
   const heights = new Set();
+  let hasNativeWebm = false;
 
   for (const f of rawFormats) {
     if (f.ext === "mhtml" || f.protocol === "mhtml") continue;
     if (f.vcodec && f.vcodec !== "none" && f.height) {
       heights.add(f.height);
+      if (f.ext === "webm") hasNativeWebm = true;
     }
   }
 
@@ -98,7 +102,7 @@ function buildFormatOptions(info) {
   const options = [
     {
       label: "Best Available",
-      note: "Auto-merged video + audio",
+      note: "Direct stream · Any size",
       preset: "best",
       container: "mp4",
       isAudio: false
@@ -118,17 +122,20 @@ function buildFormatOptions(info) {
     }
   }
 
-  options.push(
-    {
+  if (hasNativeWebm) {
+    options.push({
       label: "Best Quality (WebM)",
       note: "VP9 / Opus",
-      preset: "best",
+      preset: "best_webm",
       container: "webm",
       isAudio: false
-    },
+    });
+  }
+
+  options.push(
     {
       label: "Best Quality (MKV)",
-      note: "Lossless mux",
+      note: "Lossless container",
       preset: "best",
       container: "mkv",
       isAudio: false
@@ -152,7 +159,19 @@ function buildFormatOptions(info) {
   return options;
 }
 
-function runProbeAttempt(targetUrl, cookiePath, extraArgs = []) {
+function getFormatSelector(formatPreset) {
+  if (formatPreset === "best_webm") {
+    return "bv*[ext=webm]+ba[ext=webm]/bv*+ba/b";
+  }
+  const heightMatch = (formatPreset || "").match(/^(\d+)p$/);
+  if (heightMatch) {
+    const h = heightMatch[1];
+    return `bv*[height<=${h}]+ba/b[height<=${h}]/bv*+ba/b`;
+  }
+  return "bv*+ba/b";
+}
+
+function runYtDlpJson(targetUrl, cookiePath, extraArgs = []) {
   return new Promise((resolve, reject) => {
     const args = [
       "-J",
@@ -182,8 +201,7 @@ function runProbeAttempt(targetUrl, cookiePath, extraArgs = []) {
         return reject(new Error(stderr || "Probe failed"));
       }
       try {
-        const info = JSON.parse(stdout);
-        resolve(info);
+        resolve(JSON.parse(stdout));
       } catch {
         reject(new Error("Failed to parse media metadata."));
       }
@@ -191,16 +209,17 @@ function runProbeAttempt(targetUrl, cookiePath, extraArgs = []) {
   });
 }
 
-async function probeUrl(targetUrl, cookiesTxt) {
+async function resolveVideoInfo(targetUrl, cookiesTxt, extraArgs = []) {
   const cookiePath = writeTempCookies(cookiesTxt);
   try {
     let info;
     try {
-      info = await runProbeAttempt(targetUrl, cookiePath);
+      info = await runYtDlpJson(targetUrl, cookiePath, extraArgs);
     } catch (firstErr) {
       if (/youtube\.com|youtu\.be/i.test(targetUrl)) {
         try {
-          info = await runProbeAttempt(targetUrl, cookiePath, [
+          info = await runYtDlpJson(targetUrl, cookiePath, [
+            ...extraArgs,
             "--extractor-args",
             "youtube:player_client=tv,web_safari,mweb"
           ]);
@@ -215,13 +234,7 @@ async function probeUrl(targetUrl, cookiesTxt) {
     if (info.is_drm || info.drm) {
       throw new Error("This video is DRM-protected and cannot be downloaded.");
     }
-
-    return {
-      url: targetUrl,
-      title: info.title || "Video",
-      duration: info.duration || 0,
-      formats: buildFormatOptions(info)
-    };
+    return info;
   } catch (err) {
     const msg = err.message || "";
     if (/DRM|Widevine|protected/i.test(msg)) {
@@ -243,137 +256,192 @@ async function probeUrl(targetUrl, cookiesTxt) {
   }
 }
 
-function scheduleCleanup(jobDir, delayMs = 15 * 60 * 1000) {
-  setTimeout(() => {
-    try {
-      fs.rmSync(jobDir, { recursive: true, force: true });
-    } catch {
-      // ignore
-    }
-  }, delayMs);
+async function probeUrl(targetUrl, cookiesTxt) {
+  const info = await resolveVideoInfo(targetUrl, cookiesTxt);
+  return {
+    url: targetUrl,
+    title: info.title || "Video",
+    duration: info.duration || 0,
+    formats: buildFormatOptions(info)
+  };
 }
 
-function startDownloadJob({ url, formatPreset = "best", container = "mp4", title = "Video", cookiesTxt }) {
-  const id = `job_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+function formatFfmpegHeaders(httpHeaders = {}) {
+  const lines = [];
+  for (const [k, v] of Object.entries(httpHeaders || {})) {
+    if (v != null && k.toLowerCase() !== "host") {
+      lines.push(`${k}: ${String(v).replace(/[\r\n]+/g, " ")}`);
+    }
+  }
+  return lines.length ? lines.join("\r\n") + "\r\n" : "";
+}
+
+// --- Zero-Disk Direct Stream Handler (Supports Multi-GB Videos on 512MB RAM!) ---
+async function handleDirectStream(req, res, jobSpec) {
+  const { url, formatPreset = "best", container = "mp4", title = "Video", cookiesTxt } = jobSpec;
   const safeTitle = sanitize(title);
-  const jobDir = path.join(TEMP_DIR, id);
-  fs.mkdirSync(jobDir, { recursive: true });
+  const outExt =
+    formatPreset === "audio_mp3"
+      ? "mp3"
+      : formatPreset === "audio_m4a"
+      ? "m4a"
+      : container || "mp4";
+  const outputFilename = `${safeTitle}.${outExt}`;
+  const encodedName = encodeURIComponent(outputFilename);
 
-  const cookiePath = writeTempCookies(cookiesTxt);
-  const outTemplate = path.join(jobDir, `${safeTitle}.%(ext)s`);
+  // 1. Audio extraction (MP3 / M4A) — small file, temp dir cleaned immediately on close
+  if (formatPreset === "audio_mp3" || formatPreset === "audio_m4a") {
+    const jobDir = path.join(TEMP_DIR, `aud_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
+    fs.mkdirSync(jobDir, { recursive: true });
+    const cookiePath = writeTempCookies(cookiesTxt);
+    const outTemplate = path.join(jobDir, `${safeTitle}.%(ext)s`);
 
-  const args = [
-    "--newline",
-    "--progress",
-    "--no-playlist",
-    "--no-warnings",
-    "-o",
-    outTemplate
-  ];
+    const args = [
+      "--no-playlist",
+      "--no-warnings",
+      "-x",
+      "--audio-format",
+      outExt,
+      "--audio-quality",
+      "0",
+      "-o",
+      outTemplate
+    ];
+    if (cookiePath) args.push("--cookies", cookiePath);
+    if (/youtube\.com|youtu\.be/i.test(url)) {
+      args.push("--extractor-args", "youtube:player_client=tv,web_safari,default");
+    }
+    args.push(url);
 
-  if (cookiePath) {
-    args.push("--cookies", cookiePath);
+    const proc = spawn("yt-dlp", args);
+    proc.on("close", (code) => {
+      removeFileQuietly(cookiePath);
+      const cleanup = () => {
+        try {
+          fs.rmSync(jobDir, { recursive: true, force: true });
+        } catch {
+          // ignore
+        }
+      };
+
+      if (code !== 0) {
+        cleanup();
+        if (!res.headersSent) sendJson(res, 500, { ok: false, error: "Audio extraction failed." });
+        return;
+      }
+
+      const files = fs.readdirSync(jobDir).filter((f) => !f.endsWith(".part"));
+      if (!files.length) {
+        cleanup();
+        if (!res.headersSent) sendJson(res, 500, { ok: false, error: "No audio output." });
+        return;
+      }
+
+      const filePath = path.join(jobDir, files[0]);
+      const stat = fs.statSync(filePath);
+      res.writeHead(200, {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": stat.size,
+        "Content-Disposition": `attachment; filename*=UTF-8''${encodedName}`,
+        "Access-Control-Allow-Origin": "*"
+      });
+      const rs = fs.createReadStream(filePath);
+      rs.on("close", cleanup);
+      rs.on("error", cleanup);
+      rs.pipe(res);
+    });
+    return;
   }
 
-  if (/youtube\.com|youtu\.be/i.test(url)) {
-    args.push("--extractor-args", "youtube:player_client=tv,web_safari,default");
-  }
+  // 2. Video stream: resolve exact stream URLs with yt-dlp -J (0 bytes written to disk!)
+  const selector = getFormatSelector(formatPreset);
+  const info = await resolveVideoInfo(url, cookiesTxt, ["-f", selector]);
 
-  if (formatPreset === "audio_mp3") {
-    args.push("-x", "--audio-format", "mp3", "--audio-quality", "0");
-  } else if (formatPreset === "audio_m4a") {
-    args.push("-x", "--audio-format", "m4a", "--audio-quality", "0");
-  } else {
-    const heightMatch = formatPreset.match(/^(\d+)p$/);
-    if (heightMatch) {
-      const h = heightMatch[1];
-      args.push("-f", `bv*[height<=${h}]+ba/b[height<=${h}]/bv*+ba/b`);
-    } else {
-      args.push("-f", "bv*+ba/b");
-    }
-    args.push("--merge-output-format", container || "mp4");
-  }
+  // Case 2A: Single progressive direct HTTP file (e.g. Facebook SD/HD MP4, direct CDN MP4)
+  if (!info.requested_formats && info.url && /^https?:\/\//i.test(info.url) && !String(info.protocol || "").includes("m3u8")) {
+    if (outExt === "mp4" || outExt === info.ext) {
+      const upstream = await fetch(info.url, { headers: info.http_headers || {} });
+      if (upstream.ok && upstream.body) {
+        const respHeaders = {
+          "Content-Type": "application/octet-stream",
+          "Content-Disposition": `attachment; filename*=UTF-8''${encodedName}`,
+          "Access-Control-Allow-Origin": "*"
+        };
+        const len = upstream.headers.get("content-length");
+        if (len) respHeaders["Content-Length"] = len;
 
-  args.push(url);
-
-  const proc = spawn("yt-dlp", args);
-
-  const job = {
-    id,
-    title: safeTitle,
-    container: container || "mp4",
-    percent: 0,
-    totalSize: "",
-    speed: "",
-    status: "starting",
-    filePath: null,
-    outputFilename: `${safeTitle}.${container || "mp4"}`,
-    error: null,
-    pid: proc.pid
-  };
-
-  jobs.set(id, job);
-
-  let stderrTail = "";
-
-  const parseProgressLine = (line) => {
-    const dlMatch = line.match(/\[download\]\s+([\d.]+)%\s+of\s+~?\s*([\d.\w]+)(?:\s+at\s+([\d.\w/]+))?/);
-    if (dlMatch) {
-      job.status = "downloading";
-      job.percent = Math.min(99, Math.round(parseFloat(dlMatch[1])));
-      job.totalSize = dlMatch[2] || job.totalSize;
-      job.speed = dlMatch[3] || job.speed;
-      return;
-    }
-    if (/\[Merger\]|\[ExtractAudio\]|Merging formats/i.test(line)) {
-      job.status = "merging";
-      job.percent = 99;
-    }
-    if (line.trim().startsWith("ERROR:")) {
-      stderrTail = line.trim();
-    }
-  };
-
-  proc.stdout.on("data", (chunk) => {
-    chunk.toString().split(/\r?\n/).forEach(parseProgressLine);
-  });
-
-  proc.stderr.on("data", (chunk) => {
-    chunk.toString().split(/\r?\n/).forEach(parseProgressLine);
-  });
-
-  proc.on("error", (err) => {
-    removeFileQuietly(cookiePath);
-    job.status = "error";
-    job.error = err.message;
-    scheduleCleanup(jobDir, 60 * 1000);
-  });
-
-  proc.on("close", (code) => {
-    removeFileQuietly(cookiePath);
-
-    if (job.status === "cancelled") {
-      scheduleCleanup(jobDir, 5000);
-      return;
-    }
-    if (code === 0) {
-      const files = fs.readdirSync(jobDir).filter((f) => !f.endsWith(".part") && !f.endsWith(".ytdl"));
-      if (files.length > 0) {
-        job.filePath = path.join(jobDir, files[0]);
-        job.outputFilename = files[0];
-        job.status = "completed";
-        job.percent = 100;
-        job.speed = "Ready";
-        scheduleCleanup(jobDir, 15 * 60 * 1000);
+        res.writeHead(200, respHeaders);
+        const nodeStream = Readable.fromWeb(upstream.body);
+        req.on("close", () => nodeStream.destroy());
+        nodeStream.pipe(res);
         return;
       }
     }
-    job.status = "error";
-    job.error = stderrTail || "Download failed or blocked by site.";
-    scheduleCleanup(jobDir, 60 * 1000);
+  }
+
+  // Case 2B: Split Video + Audio OR HLS stream -> Zero-Disk FFmpeg Live Mux Pipe!
+  const ffArgs = ["-y", "-loglevel", "error"];
+
+  if (Array.isArray(info.requested_formats) && info.requested_formats.length >= 2) {
+    const vFmt = info.requested_formats[0];
+    const aFmt = info.requested_formats[1];
+    const vHeaders = formatFfmpegHeaders(vFmt.http_headers || info.http_headers);
+    const aHeaders = formatFfmpegHeaders(aFmt.http_headers || info.http_headers);
+
+    if (vHeaders) ffArgs.push("-headers", vHeaders);
+    ffArgs.push("-i", vFmt.url);
+
+    if (aHeaders) ffArgs.push("-headers", aHeaders);
+    ffArgs.push("-i", aFmt.url);
+
+    if (outExt === "webm") {
+      const bothWebm = vFmt.ext === "webm" && aFmt.ext === "webm";
+      if (bothWebm) {
+        ffArgs.push("-c", "copy", "-f", "webm", "pipe:1");
+      } else {
+        ffArgs.push("-c:v", "libvpx-vp9", "-crf", "33", "-b:v", "0", "-deadline", "realtime", "-c:a", "libopus", "-f", "webm", "pipe:1");
+      }
+    } else if (outExt === "mkv") {
+      ffArgs.push("-c", "copy", "-f", "matroska", "pipe:1");
+    } else {
+      ffArgs.push("-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1");
+    }
+  } else if (info.url) {
+    const hdrs = formatFfmpegHeaders(info.http_headers);
+    if (hdrs) ffArgs.push("-headers", hdrs);
+    ffArgs.push("-i", info.url);
+
+    if (outExt === "mkv") {
+      ffArgs.push("-c", "copy", "-f", "matroska", "pipe:1");
+    } else if (outExt === "webm") {
+      ffArgs.push("-c:v", "libvpx-vp9", "-crf", "33", "-b:v", "0", "-deadline", "realtime", "-c:a", "libopus", "-f", "webm", "pipe:1");
+    } else {
+      ffArgs.push("-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1");
+    }
+  } else {
+    throw new Error("No streamable URL resolved.");
+  }
+
+  res.writeHead(200, {
+    "Content-Type": "application/octet-stream",
+    "Content-Disposition": `attachment; filename*=UTF-8''${encodedName}`,
+    "Access-Control-Allow-Origin": "*"
   });
 
-  return job;
+  const ff = spawn("ffmpeg", ffArgs);
+  ff.stdout.pipe(res);
+
+  ff.stderr.on("data", (d) => {
+    console.error("[ffmpeg]", d.toString().trim());
+  });
+
+  req.on("close", () => {
+    try {
+      ff.kill("SIGKILL");
+    } catch {
+      // ignore
+    }
+  });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -387,36 +455,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && (reqUrl.pathname === "/" || reqUrl.pathname === "/health")) {
       return sendJson(res, 200, {
         ok: true,
-        mode: "cloud",
+        mode: "cloud-stream",
         ytdlp: BIN_STATUS.ytdlp,
         ffmpeg: BIN_STATUS.ffmpeg
       });
-    }
-
-    if (req.method === "GET" && reqUrl.pathname === "/jobs") {
-      const publicJobs = Array.from(jobs.values())
-        .reverse()
-        .slice(0, 15)
-        .map(({ filePath, pid, ...rest }) => rest);
-      return sendJson(res, 200, { ok: true, jobs: publicJobs });
-    }
-
-    if (req.method === "GET" && reqUrl.pathname.startsWith("/file/")) {
-      const jobId = reqUrl.pathname.slice("/file/".length);
-      const job = jobs.get(jobId);
-      if (!job || !job.filePath || !fs.existsSync(job.filePath)) {
-        return sendJson(res, 404, { ok: false, error: "File expired or not ready." });
-      }
-      const stat = fs.statSync(job.filePath);
-      const encodedName = encodeURIComponent(job.outputFilename);
-      res.writeHead(200, {
-        "Content-Type": "application/octet-stream",
-        "Content-Length": stat.size,
-        "Content-Disposition": `attachment; filename*=UTF-8''${encodedName}`,
-        "Access-Control-Allow-Origin": "*"
-      });
-      fs.createReadStream(job.filePath).pipe(res);
-      return;
     }
 
     if (req.method === "POST" && reqUrl.pathname === "/probe") {
@@ -426,34 +468,56 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, ...result });
     }
 
-    if (req.method === "POST" && reqUrl.pathname === "/download") {
+    if (req.method === "POST" && reqUrl.pathname === "/prepare") {
       const body = await readBody(req);
       if (!body.url) return sendJson(res, 400, { ok: false, error: "URL is required." });
-      const job = startDownloadJob(body);
-      const { filePath, pid, ...publicJob } = job;
-      return sendJson(res, 200, { ok: true, job: publicJob });
+
+      const token = `tok_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      const safeTitle = sanitize(body.title || "Video");
+      const outExt =
+        body.formatPreset === "audio_mp3"
+          ? "mp3"
+          : body.formatPreset === "audio_m4a"
+          ? "m4a"
+          : body.container || "mp4";
+
+      streamTokens.set(token, {
+        url: body.url,
+        formatPreset: body.formatPreset || "best",
+        container: outExt,
+        title: safeTitle,
+        cookiesTxt: body.cookiesTxt || "",
+        createdAt: Date.now()
+      });
+
+      setTimeout(() => streamTokens.delete(token), 3 * 60 * 1000);
+
+      return sendJson(res, 200, {
+        ok: true,
+        token,
+        filename: `${safeTitle}.${outExt}`
+      });
     }
 
-    if (req.method === "POST" && reqUrl.pathname === "/cancel") {
-      const body = await readBody(req);
-      const job = jobs.get(body.jobId);
-      if (job && job.pid) {
-        job.status = "cancelled";
-        try {
-          process.kill(job.pid, "SIGKILL");
-        } catch {
-          // ignore
-        }
+    if (req.method === "GET" && reqUrl.pathname.startsWith("/stream/")) {
+      const token = reqUrl.pathname.slice("/stream/".length);
+      const spec = streamTokens.get(token);
+      if (!spec) {
+        return sendJson(res, 404, { ok: false, error: "Download token expired." });
       }
-      return sendJson(res, 200, { ok: true });
+      streamTokens.delete(token);
+      await handleDirectStream(req, res, spec);
+      return;
     }
 
     sendJson(res, 404, { ok: false, error: "Not found" });
   } catch (err) {
-    sendJson(res, 500, { ok: false, error: err.message || "Server error" });
+    if (!res.headersSent) {
+      sendJson(res, 500, { ok: false, error: err.message || "Server error" });
+    }
   }
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`StreamGrab Pro Cloud Engine listening on http://${HOST}:${PORT}`);
+  console.log(`StreamGrab Pro Zero-Disk Cloud Engine listening on http://${HOST}:${PORT}`);
 });
